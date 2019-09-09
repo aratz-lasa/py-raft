@@ -102,3 +102,15 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# pycharm
+.idea/
+
+# pipenv
+Pipfile
+Pipfile.lock
+
+# logs
+logs
+!logs/.gitkeep
+
