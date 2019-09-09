@@ -7,4 +7,7 @@ install:
   - pip install -r dev_requirements.txt
 # command to run tests
 script:
-  - pytest
+  - pytest --cov-report term --cov=./ tests/
+# Upload coverage report to 'Codecov'
+after_success:
+  - codecov --token=eeabad80-f0a5-4cb4-8d49-fb88d5d58315
