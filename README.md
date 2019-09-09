@@ -1,4 +1,8 @@
-# raft [![Build Status](https://travis-ci.com/aratz-lasa/raft.svg?token=14vGnmnCyxosg26uva6k&branch=master)](https://travis-ci.com/aratz-lasa/raft)
+# raft
+[![Build Status](https://travis-ci.com/aratz-lasa/raft.svg?token=14vGnmnCyxosg26uva6k&branch=master)](https://travis-ci.com/aratz-lasa/raft) 
+[![codecov](https://codecov.io/gh/aratz-lasa/raft/branch/master/graph/badge.svg?token=2lheZbjYK7)](https://codecov.io/gh/aratz-lasa/raft)
+
+
 Python **asyncio RAFT** consensus algorithm implementation.
 
 ## What is Raft?
