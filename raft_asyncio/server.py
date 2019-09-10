@@ -39,8 +39,9 @@ class Server:
         self._listener_task = None
 
     async def _start_listening(self):
-        self._listener_task = await asyncio.start_server(self._handle_request,
-                                                         self.ip, self.port)
+        self._listener_task = await asyncio.start_server(
+            self._handle_request, self.ip, self.port
+        )
 
     async def _handle_request(self, reader, writer):
         opcode = (await reader.readuntil(rpc.SEPARATOR))[:-1]
@@ -54,14 +55,20 @@ class Server:
 
 
 class RaftServer(IRaftServer, Server, RaftStateMachine):
-    def __init__(self, ip: str, port: int, cluster, state: State = State.FOLLOWER, log=None):
+    def __init__(
+        self, ip: str, port: int, cluster, state: State = State.FOLLOWER, log=None
+    ):
         Server.__init__(self, ip, port, cluster)
         RaftStateMachine.__init__(self, state, log)
 
         self._current_term = 0  # latest term server has see
         self._voted_for = None  # candidateId that received vote in currentterm
-        self._next_indexes = {}  # for each server, index of the next log entryto send to that server
-        self._match_indexes = {}  # for each server, index of highest log entryknown to be replicated on server
+        self._next_indexes = (
+            {}
+        )  # for each server, index of the next log entryto send to that server
+        self._match_indexes = (
+            {}
+        )  # for each server, index of highest log entryknown to be replicated on server
         # TODO: init tasks
 
     async def update_state(self, key, value):
@@ -79,7 +86,9 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
     async def _elections_task(self):
         while True:
             try:
-                await asyncio.wait_for(self._leader_hbeat.wait(), timeout=ELECTION_TIMEOUT)  # TODO: random timeout
+                await asyncio.wait_for(
+                    self._leader_hbeat.wait(), timeout=ELECTION_TIMEOUT
+                )  # TODO: random timeout
             except asyncio.TimeoutError:
                 await self._begin_election()
             finally:
@@ -92,8 +101,25 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         last_log_term = 0 if not self._log else self._log[last_log_index].term
         servers = [s for s in self.cluster if s is not self]
         voting_rpcs = list(
-            map(lambda s: s.request_vote(self._current_term, self.id, last_log_index, last_log_term), servers))
-        voting_results = await asyncio.gather(*voting_rpcs)
-        if sum(voting_results) + 1 >= (len(self.cluster) // 2) + 1:  # +1 is its own vote
+            map(
+                lambda s: s.request_vote(
+                    self._current_term, self.id, last_log_index, last_log_term
+                ),
+                servers,
+            )
+        )
+        granted_votes = 1  # 1 -> its own vote
+        votes = 1
+        election_win = False
+        for next_vote in asyncio.as_completed(*voting_rpcs):
+            try:
+                vote = (await next_vote).result()
+                granted_votes += int(vote)
+            except:
+                pass
+            votes += 1
+            if granted_votes > len(self.cluster) // 2:
+                election_win = True
+        if election_win:
             pass
             # TODO: change to leader
