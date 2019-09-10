@@ -5,8 +5,6 @@
 
 Python **asyncio RAFT** consensus algorithm implementation.
 
-It is meant to use as a demo, so it just works on your own laptop. It is not designed for creating a real cluster phisically distributed.
-
 ## What is Raft?
 Raft is a consensus algorithm that is designed to be easy to understand. It's equivalent to Paxos in fault-tolerance and performance.
 
