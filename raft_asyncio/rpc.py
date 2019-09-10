@@ -120,6 +120,7 @@ class Request:
 async def handle_request(raft_server: server.RaftServer, request: Request):
     reader = request.reader
     writer = request.writer
+
     if request.opcode is RPC.REQUEST_VOTE:
         payload_lst = request.payload.split(SEPARATOR, 3)
         term = int.from_bytes(payload_lst[0], "big")
