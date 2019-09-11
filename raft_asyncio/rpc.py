@@ -2,20 +2,22 @@ import asyncio
 import math
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import IntEnum, auto
 from typing import Any
 
-from . import server, utils
+from . import server, utils, state_machine, errors
 
 # CONSTANTS
 SEPARATOR = b","
+OK_RESPONSE = 0
 CONNECTION_TIMEOUT = 5
 
 
 # RPC opcodes
 class RPC(IntEnum):
-    APPEND_ENTRIES = 0
-    REQUEST_VOTE = 1
+    APPEND_ENTRIES = auto()
+    COMMIT_COMMAND = auto()
+    REQUEST_VOTE = auto()
 
 
 ## Outgoing calls
@@ -73,6 +75,14 @@ class RemoteRaftServer:
             vote = await reader.read()
         return vote
 
+    async def commit_command(self, command: state_machine.Command):
+        with connect(self) as connection:
+            [reader, writer] = connection
+            payload = SEPARATOR.join([command.key, command.value])
+            writer.write(_dump_request(RPC.COMMIT_COMMAND, payload))
+            await writer.drain()
+            await _check_ok(reader)
+
 
 @asynccontextmanager
 async def connect(dst: RemoteRaftServer, raise_error=True):
@@ -106,6 +116,17 @@ def _get_int_bytes_amount(number: int):
     return math.ceil(math.log(number, 256))
 
 
+async def _send_ok(writer):
+    writer.write(bytes([OK_RESPONSE]))
+    await writer.drain()
+
+
+async def _check_ok(reader):
+    ok = int.from_bytes(await reader.read(1), "big") == OK_RESPONSE
+    if not ok:
+        raise errors.RPCError()
+
+
 ## Ingoing calls
 
 
@@ -135,6 +156,11 @@ async def handle_request(raft_server: server.RaftServer, request: Request):
     elif request.opcode is RPC.APPEND_ENTRIES:
         pass
         # TODO
+    elif request.opcode is RPC.COMMIT_COMMAND:
+        [key, value] = request.payload.split(SEPARATOR, 1)
+        command = state_machine.Command(key, value)
+        await raft_server.queue_command(command)
+        await _send_ok(writer)
 
 
 def is_vote_granted(raft_server, term, candidate_id, last_log_index, last_log_term):

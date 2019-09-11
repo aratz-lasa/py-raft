@@ -4,7 +4,7 @@ from typing import Any
 
 from . import rpc, utils
 from .abc import IRaftServer
-from .state_machine import RaftStateMachine, State
+from .state_machine import RaftStateMachine, State, Command
 
 ELECTION_TIMEOUT = 0.5
 
@@ -123,3 +123,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         if election_win:
             pass
             # TODO: change to leader
+
+    async def queue_command(self, command: Command):
+        pass
+        # TODO
