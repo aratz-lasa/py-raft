@@ -159,7 +159,7 @@ async def handle_request(raft_server: server.RaftServer, request: Request):
     elif request.opcode is RPC.COMMIT_COMMAND:
         [key, value] = request.payload.split(SEPARATOR, 1)
         command = state_machine.Command(key, value)
-        await raft_server.queue_command(command)
+        await raft_server._queue_command(command)
         await _send_ok(writer)
 
 
