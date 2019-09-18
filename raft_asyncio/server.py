@@ -6,6 +6,7 @@ from .abc import IRaftServer
 from .state_machine import RaftStateMachine, State, Command
 
 ELECTION_TIMEOUT = 0.5
+FLEXIBLE_PAXOS_QUORUM = 2 / 6
 RPC_TIMEOUT = 1
 
 
@@ -17,8 +18,6 @@ class Server:
         self._cluster: List[rpc.RemoteRaftServer] = cluster or []
         self._leader = None
         self._leader_hbeat = asyncio.Event()
-        self._persistent_state_data = ServerPersistentStateData()
-        self._volatile_state_data = ServerVolatileStateData()
         self._leader_volatile_state_data = None
         self._listener_task = None
 
@@ -34,7 +33,10 @@ class Server:
         payload_length = int.from_bytes(payload_length, "big")
         payload = await reader.read(payload_length)
         request = rpc.Request(reader, writer, opcode, payload)
-        await rpc.handle_request(self, request)
+        if isinstance(self, RaftServer):
+            await rpc.handle_request(self, request)
+        else:
+            raise TypeError("Invalid Server instance")
         writer.close()
 
 
@@ -107,7 +109,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                     committed_amount += 1
                 except:
                     pass
-            if committed_amount >= len(self._cluster):
+            if committed_amount >= int(len(self._cluster) * FLEXIBLE_PAXOS_QUORUM):
                 self._commit_command(command)
 
     async def _begin_election(self):
@@ -133,8 +135,8 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             except:
                 pass
             votes += 1
-            if (
-                granted_votes >= len(self._cluster) // 2
+            if granted_votes >= int(
+                len(self._cluster) * (1 - FLEXIBLE_PAXOS_QUORUM) + 1
             ):  # Equal because itself is not considered
                 election_win = True
         if election_win:
