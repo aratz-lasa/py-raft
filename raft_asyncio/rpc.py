@@ -3,7 +3,7 @@ import math
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any
+from typing import Any, List
 
 from . import server, utils, state_machine, errors
 
@@ -15,7 +15,7 @@ CONNECTION_TIMEOUT = 5
 
 # RPC opcodes
 class RPC(IntEnum):
-    APPEND_ENTRIES = auto()
+    APPEND_ENTRY = auto()
     COMMIT_COMMAND = auto()
     REQUEST_VOTE = auto()
 
@@ -27,8 +27,14 @@ class RemoteRaftServer:
         self.port = port
         self.id = utils.get_id(self, ip, port)
 
-    async def append_entries(
-        self, term, leader_id, prev_log_index, prev_log_term, entries, leader_commit
+    async def append_entry(
+        self,
+        term: int,
+        leader_id: bytes,
+        prev_log_index: int,
+        prev_log_term: int,
+        entry: state_machine.Command,
+        leader_commit: int,
     ):
         """
         Invoked by leader to replicate log entries; also used as heartbeat
@@ -36,14 +42,30 @@ class RemoteRaftServer:
         :param leader_id:       so follower can redirect clients
         :param prev_log_index:  index of log entry immediately precedingnew ones
         :param prev_log_term:   term of prevLogIndex entry
-        :param entries:         log entries to store (empty for heartbeat; may send more than one for efficiency)
+        :param entry:         log entry to store (empty for heartbeat)
         :param leader_commit:   leader’s commitIndex
         :return:
                 term:       currentTerm, for leader to update itself
                 success:    true if follower contained entry matching prevLogIndex and prevLogTerm
         """
-        pass
-        # TODO
+        with connect(self) as connection:
+            [reader, writer] = connection
+            payload = SEPARATOR.join(
+                [
+                    term.to_bytes(_get_int_bytes_amount(term), "big"),
+                    leader_id,
+                    prev_log_index.to_bytes(
+                        _get_int_bytes_amount(prev_log_index), "big"
+                    ),
+                    prev_log_term.to_bytes(_get_int_bytes_amount(prev_log_term), "big"),
+                    entry.key,
+                    entry.value,
+                    leader_commit.to_bytes(_get_int_bytes_amount(leader_commit), "big"),
+                ]
+            )
+            writer.write(_dump_request(RPC.APPEND_ENTRY, payload))
+            await writer.drain()
+            await _check_ok(reader)
 
     async def request_vote(
         self, term: int, candidate_id: bytes, last_log_index: int, last_log_term: int
@@ -153,9 +175,33 @@ async def handle_request(raft_server: server.RaftServer, request: Request):
             int(is_vote_granted(raft_server, term, id, last_log_index, last_log_term))
         )
         await writer.drain()
-    elif request.opcode is RPC.APPEND_ENTRIES:
-        pass
-        # TODO
+    elif request.opcode is RPC.APPEND_ENTRY:
+        payload_lst = request.payload.split(SEPARATOR, 6)
+        term = int.from_bytes(payload_lst[0], "big")
+        leader_id = payload_lst[1]
+        prev_log_index = int.from_bytes(payload_lst[2], "big")
+        prev_log_term = int.from_bytes(payload_lst[3], "big")
+        entry = state_machine.Command(payload_lst[4], payload_lst[5])
+        leader_commit = int.from_bytes(payload_lst[6], "big")
+
+        if is_entry_appendable(
+            raft_server,
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entry,
+            leader_commit,
+        ):
+            raft_server._append_command(entry.command)
+            if leader_commit > raft_server._commit_index:
+                raft_server._commit_index = min(
+                    leader_commit, raft_server._last_applied
+                )  # TODO: Check why
+            await _send_ok(writer)
+        else:
+            pass  # TODO
+
     elif request.opcode is RPC.COMMIT_COMMAND:
         [key, value] = request.payload.split(SEPARATOR, 1)
         command = state_machine.Command(key, value)
@@ -179,4 +225,21 @@ def is_vote_granted(raft_server, term, candidate_id, last_log_index, last_log_te
         granted = False
     return granted
 
-    # TODO
+
+def is_entry_appendable(
+    raft_server: server.RaftServer,
+    term: int,
+    leader_id: bytes,
+    prev_log_index: int,
+    prev_log_term: int,
+    entry: state_machine.Command,
+    leader_commit: int,
+):
+    if term < raft_server._current_term:
+        return False
+    elif (
+        len(raft_server._log) < prev_log_index - 1
+        or raft_server._log[prev_log_index] != prev_log_term
+    ):
+        return False
+    return True

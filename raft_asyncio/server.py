@@ -91,12 +91,12 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             self._append_command(command)
             rpc_calls = list(
                 map(
-                    lambda s: s.append_entries(
+                    lambda s: s.append_entry(
                         self._current_term,
                         self.id,
                         self._last_applied,
                         self._log[self._last_applied].term,
-                        [command],
+                        command,
                         self._commit_index,
                     ),
                     self._cluster,
