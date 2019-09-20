@@ -11,5 +11,9 @@ class IRaftServer(ABC):
         pass
 
     @abstractmethod
+    async def remove_cluster_member(self, id):
+        pass
+
+    @abstractmethod
     async def update_state(self, key, value):
         pass

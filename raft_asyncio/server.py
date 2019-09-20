@@ -10,11 +10,16 @@ FLEXIBLE_PAXOS_QUORUM = 2 / 6
 RPC_TIMEOUT = 1
 
 
-class Server:
-    def __init__(self, ip: str, port: int, cluster):
+class ClusterMember:
+    def __init__(self, ip: str, port: int):
         self.ip = ip
         self.port = port
         self.id = utils.get_id(self, ip, port)
+
+
+class Server(ClusterMember):
+    def __init__(self, ip: str, port: int, cluster):
+        super().__init__(ip, port)
         self._cluster: List[rpc.RemoteRaftServer] = cluster or []
         self._leader = None
         self._leader_hbeat = asyncio.Event()
@@ -66,13 +71,25 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         else:
             await self._leader.commit_command(command)
 
-    async def join_cluster(self, random_server):
-        pass
-        # TODO: generate new configuration with itself and join cluster
+    async def join_cluster(self, random_server: ClusterMember):
+        if random_server:
+            remote_server = rpc.RemoteRaftServer(random_server.ip, random_server.port)
+            [
+                self.cluster,
+                self._leader,
+            ] = await remote_server.get_cluster_configuration()
+            self.cluster.append(self)
+            # TODO: init configuration change
+        else:
+            pass  # TODO: first cluster member
 
     async def leave_cluster(self):
-        pass
-        # TODO: generate new configuration without itself and leave cluster
+        self.cluster.remove(self)
+        # TODO: init configuration change
+
+    async def remove_cluster_member(self, id):
+        self.cluster = list(filter(lambda s: s.id != id, self.cluster))
+        # TODO: init configuration change
 
     async def _elections_task(self):
         while True:
@@ -145,3 +162,6 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
 
     async def _queue_command(self, command: Command):
         await self._commands_queue.put(command)
+
+    def _im_leader(self):
+        return self._leader is self

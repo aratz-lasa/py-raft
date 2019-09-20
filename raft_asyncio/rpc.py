@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Any, List
 
-from . import server, utils, state_machine, errors
+from . import server, state_machine, errors
 
 # CONSTANTS
 SEPARATOR = b","
@@ -18,22 +18,19 @@ class RPC(IntEnum):
     APPEND_ENTRY = auto()
     COMMIT_COMMAND = auto()
     REQUEST_VOTE = auto()
+    ADD_CLUSTER_CONFIGURATION = auto()
+    GET_CLUSTER_CONFIGURATION = auto()
 
 
 ## Outgoing calls
-class RemoteRaftServer:
-    def __init__(self, ip, port):
-        self.ip = ip
-        self.port = port
-        self.id = utils.get_id(self, ip, port)
-
+class RemoteRaftServer(server.ClusterMember):
     async def append_entry(
         self,
         term: int,
         leader_id: bytes,
         prev_log_index: int,
         prev_log_term: int,
-        entry: state_machine.Command,
+        entry: state_machine.Entry,
         leader_commit: int,
     ):
         """
@@ -58,8 +55,9 @@ class RemoteRaftServer:
                         _get_int_bytes_amount(prev_log_index), "big"
                     ),
                     prev_log_term.to_bytes(_get_int_bytes_amount(prev_log_term), "big"),
-                    entry.key,
-                    entry.value,
+                    entry.term,
+                    entry.command.key,
+                    entry.command.value,
                     leader_commit.to_bytes(_get_int_bytes_amount(leader_commit), "big"),
                 ]
             )
@@ -104,6 +102,12 @@ class RemoteRaftServer:
             writer.write(_dump_request(RPC.COMMIT_COMMAND, payload))
             await writer.drain()
             await _check_ok(reader)
+
+    async def add_cluster_configuration(self, cluster: List[server.ClusterMember]):
+        pass  # TODO
+
+    async def get_cluster_configuration(self):
+        pass  # TODO: return cluster and leader
 
 
 @asynccontextmanager
@@ -160,53 +164,36 @@ class Request:
     payload: Any = field(default=None)
 
 
+# Main switch case for Requests
 async def handle_request(raft_server: server.RaftServer, request: Request):
     reader = request.reader
     writer = request.writer
 
     if request.opcode is RPC.REQUEST_VOTE:
-        payload_lst = request.payload.split(SEPARATOR, 3)
-        term = int.from_bytes(payload_lst[0], "big")
-        id = payload_lst[1]
-        last_log_index = int.from_bytes(payload_lst[2], "big")
-        last_log_term = int.from_bytes(payload_lst[3], "big")
-
-        writer.write(
-            int(is_vote_granted(raft_server, term, id, last_log_index, last_log_term))
-        )
-        await writer.drain()
+        await process_vote(raft_server, request, writer)
     elif request.opcode is RPC.APPEND_ENTRY:
-        payload_lst = request.payload.split(SEPARATOR, 6)
-        term = int.from_bytes(payload_lst[0], "big")
-        leader_id = payload_lst[1]
-        prev_log_index = int.from_bytes(payload_lst[2], "big")
-        prev_log_term = int.from_bytes(payload_lst[3], "big")
-        entry = state_machine.Command(payload_lst[4], payload_lst[5])
-        leader_commit = int.from_bytes(payload_lst[6], "big")
-
-        if is_entry_appendable(
-            raft_server,
-            term,
-            leader_id,
-            prev_log_index,
-            prev_log_term,
-            entry,
-            leader_commit,
-        ):
-            raft_server._append_command(entry.command)
-            if leader_commit > raft_server._commit_index:
-                raft_server._commit_index = min(
-                    leader_commit, raft_server._last_applied
-                )  # TODO: Check why
-            await _send_ok(writer)
+        await process_entry(raft_server, request, writer)
+    elif request.opcode is RPC.COMMIT_COMMAND:
+        if raft_server._im_leader():
+            await process_commit(raft_server, request, writer)
         else:
             pass  # TODO
+    elif request.opcode is RPC.ADD_CLUSTER_CONFIGURATION:
+        pass  # TODO
+    elif request.opcode is RPC.GET_CLUSTER_CONFIGURATION:
+        await process_cluster(raft_server, writer)
 
-    elif request.opcode is RPC.COMMIT_COMMAND:
-        [key, value] = request.payload.split(SEPARATOR, 1)
-        command = state_machine.Command(key, value)
-        await raft_server._queue_command(command)
-        await _send_ok(writer)
+
+async def process_vote(raft_server, request, writer):
+    payload_lst = request.payload.split(SEPARATOR, 3)
+    term = int.from_bytes(payload_lst[0], "big")
+    id = payload_lst[1]
+    last_log_index = int.from_bytes(payload_lst[2], "big")
+    last_log_term = int.from_bytes(payload_lst[3], "big")
+    writer.write(
+        int(is_vote_granted(raft_server, term, id, last_log_index, last_log_term))
+    )
+    await writer.drain()
 
 
 def is_vote_granted(raft_server, term, candidate_id, last_log_index, last_log_term):
@@ -226,14 +213,31 @@ def is_vote_granted(raft_server, term, candidate_id, last_log_index, last_log_te
     return granted
 
 
+async def process_entry(raft_server: server.RaftServer, request: Request, writer):
+    payload_lst = request.payload.split(SEPARATOR, 7)
+    term = int.from_bytes(payload_lst[0], "big")
+    leader_id = payload_lst[1]
+    prev_log_index = int.from_bytes(payload_lst[2], "big")
+    prev_log_term = int.from_bytes(payload_lst[3], "big")
+    entry_term = int.from_bytes(payload_lst[4], "big")
+    command = state_machine.Command(payload_lst[5], payload_lst[6])
+    entry = state_machine.Entry(command, entry_term)
+    leader_commit = int.from_bytes(payload_lst[7], "big")
+
+    if is_entry_appendable(raft_server, term, prev_log_index, prev_log_term):
+        raft_server._append_command(entry.command)
+        raft_server._leader = leader_id  # Update leader
+        if leader_commit > raft_server._commit_index:
+            raft_server._commit_index = min(
+                leader_commit, raft_server._last_applied
+            )  # TODO: Check why
+        await _send_ok(writer)
+    else:
+        pass  # TODO
+
+
 def is_entry_appendable(
-    raft_server: server.RaftServer,
-    term: int,
-    leader_id: bytes,
-    prev_log_index: int,
-    prev_log_term: int,
-    entry: state_machine.Command,
-    leader_commit: int,
+    raft_server: server.RaftServer, term: int, prev_log_index: int, prev_log_term: int
 ):
     if term < raft_server._current_term:
         return False
@@ -243,3 +247,24 @@ def is_entry_appendable(
     ):
         return False
     return True
+
+
+async def process_commit(raft_server: server.RaftServer, request: Request, writer):
+    [key, value] = request.payload.split(SEPARATOR, 1)
+    command = state_machine.Command(key, value)
+    await raft_server._queue_command(command)
+    await _send_ok(writer)
+
+
+async def process_cluster(raft_server: server.RaftServer, writer):
+    payload = b""
+    for member in raft_server.cluster:
+        payload += (
+            SEPARATOR * 2
+            + member.ip.encode()
+            + SEPARATOR
+            + member.port.to_bytes(_get_int_bytes_amount(member.port), "big"),
+        )
+    payload = payload[2:] + SEPARATOR * 2 + raft_server._leader.id
+    writer.write(payload)
+    await writer.drain()

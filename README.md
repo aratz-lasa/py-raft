@@ -16,5 +16,5 @@ Flexible Paxos is the simple observation that it is not necessary to require all
 *TODO*
 
 # References
-[RAFT web page](https://raft.github.io/)
-[Flexible Paxos web page](https://fpaxos.github.io/)
+- [RAFT web page](https://raft.github.io/)
+- [Flexible Paxos web page](https://fpaxos.github.io/)
