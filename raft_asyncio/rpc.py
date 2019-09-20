@@ -9,6 +9,7 @@ from . import server, state_machine, errors
 
 # CONSTANTS
 SEPARATOR = b","
+DOUBLE_SEPARATOR = SEPARATOR * 2
 OK_RESPONSE = 0
 CONNECTION_TIMEOUT = 5
 
@@ -46,7 +47,7 @@ class RemoteRaftServer(server.ClusterMember):
                 success:    true if follower contained entry matching prevLogIndex and prevLogTerm
         """
         with connect(self) as connection:
-            [reader, writer] = connection
+            reader, writer = connection
             payload = SEPARATOR.join(
                 [
                     term.to_bytes(_get_int_bytes_amount(term), "big"),
@@ -79,7 +80,7 @@ class RemoteRaftServer(server.ClusterMember):
                 vote_granted:   true means candidate received vote
         """
         with connect(self) as connection:
-            [reader, writer] = connection
+            reader, writer = connection
             payload = SEPARATOR.join(
                 [
                     term.to_bytes(_get_int_bytes_amount(term), "big"),
@@ -92,12 +93,12 @@ class RemoteRaftServer(server.ClusterMember):
             )
             writer.write(_dump_request(RPC.REQUEST_VOTE, payload))
             await writer.drain()
-            vote = await reader.read()
+            vote = await reader.read(1)
         return vote
 
     async def commit_command(self, command: state_machine.Command):
         with connect(self) as connection:
-            [reader, writer] = connection
+            reader, writer = connection
             payload = SEPARATOR.join([command.key, command.value])
             writer.write(_dump_request(RPC.COMMIT_COMMAND, payload))
             await writer.drain()
@@ -107,7 +108,28 @@ class RemoteRaftServer(server.ClusterMember):
         pass  # TODO
 
     async def get_cluster_configuration(self):
-        pass  # TODO: return cluster and leader
+        with connect(self) as connection:
+            reader, writer = connection
+            payload = b""
+            writer.write(_dump_request(RPC.GET_CLUSTER_CONFIGURATION, payload))
+            await writer.drain()
+
+            payload_length = (await reader.read_until(SEPARATOR))[:-1]
+            raw_cluster, leader_id = (await reader.read(payload_length)).rsplit(
+                DOUBLE_SEPARATOR, 1
+            )
+            cluster = list(
+                map(
+                    lambda x: RemoteRaftServer(
+                        x[0].decode(), int.from_bytes(x[1], "big")
+                    ),
+                    map(
+                        lambda s: s.split(SEPARATOR),
+                        raw_cluster.split(DOUBLE_SEPARATOR),
+                    ),
+                )
+            )
+        return cluster, leader_id
 
 
 @asynccontextmanager
@@ -226,7 +248,8 @@ async def process_entry(raft_server: server.RaftServer, request: Request, writer
 
     if is_entry_appendable(raft_server, term, prev_log_index, prev_log_term):
         raft_server._append_command(entry.command)
-        raft_server._leader = leader_id  # Update leader
+        new_leader = list(filter(lambda s: s.id == leader_id, raft_server.cluster))[0]
+        raft_server._leader = new_leader  # Update leader
         if leader_commit > raft_server._commit_index:
             raft_server._commit_index = min(
                 leader_commit, raft_server._last_applied
@@ -260,11 +283,12 @@ async def process_cluster(raft_server: server.RaftServer, writer):
     payload = b""
     for member in raft_server.cluster:
         payload += (
-            SEPARATOR * 2
+            DOUBLE_SEPARATOR
             + member.ip.encode()
             + SEPARATOR
             + member.port.to_bytes(_get_int_bytes_amount(member.port), "big"),
         )
     payload = payload[2:] + SEPARATOR * 2 + raft_server._leader.id
+    payload = _dump_data_with_length(payload)
     writer.write(payload)
     await writer.drain()

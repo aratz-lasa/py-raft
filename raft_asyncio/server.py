@@ -74,10 +74,9 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
     async def join_cluster(self, random_server: ClusterMember):
         if random_server:
             remote_server = rpc.RemoteRaftServer(random_server.ip, random_server.port)
-            [
-                self.cluster,
-                self._leader,
-            ] = await remote_server.get_cluster_configuration()
+            self.cluster, leader_id = await remote_server.get_cluster_configuration()
+            self.leader = list(filter(lambda s: s.id == leader_id, self.cluster))[0]
+
             self.cluster.append(self)
             # TODO: init configuration change
         else:
