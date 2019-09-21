@@ -1,7 +1,9 @@
 import asyncio
 from typing import List
 
-from . import rpc, utils
+from . import utils
+from .rpc import rpc
+from .rpc import protocol as prot
 from .abc import IRaftServer
 from .state_machine import RaftStateMachine, State, Command
 
@@ -32,12 +34,7 @@ class Server(ClusterMember):
         )
 
     async def _handle_request(self, reader, writer):
-        opcode = (await reader.readuntil(rpc.SEPARATOR))[:-1]
-        opcode = int.from_bytes(opcode, "big")
-        payload_length = (await reader.readuntil(rpc.SEPARATOR))[:-1]
-        payload_length = int.from_bytes(payload_length, "big")
-        payload = await reader.read(payload_length)
-        request = rpc.Request(reader, writer, opcode, payload)
+        request = prot.read_decode_msg(reader, writer)
         if isinstance(self, RaftServer):
             await rpc.handle_request(self, request)
         else:
@@ -62,6 +59,9 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         self._commands_queue = (
             asyncio.Queue()
         )  # Queue where commands waiting for commit process to start  are stored
+        self._election_task = None
+        self._commit_task = None
+        self._leader_task = None
         # TODO: init tasks
 
     async def update_state(self, key, value):
@@ -69,7 +69,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         if self._leader is self:
             await self._queue_command(command)
         else:
-            await self._leader.commit_command(command)
+            await self._leader.command_request(command)
 
     async def join_cluster(self, random_server: ClusterMember):
         if random_server:
@@ -90,24 +90,24 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         self.cluster = list(filter(lambda s: s.id != id, self.cluster))
         # TODO: init configuration change
 
-    async def _elections_task(self):
+    async def _run_timeout_task(self):
         while True:
             try:
                 await asyncio.wait_for(
                     self._leader_hbeat.wait(), timeout=ELECTION_TIMEOUT
                 )  # TODO: random timeout
             except asyncio.TimeoutError:
-                await self._begin_election()
+                await self._change_state(State.CANDIDATE)
             finally:
                 self._leader_hbeat.clear()
 
-    async def _commit_task(self):
+    async def _run_commit_task_(self):
         while True:
             command = await self._commands_queue.get()
             self._append_command(command)
             rpc_calls = list(
                 map(
-                    lambda s: s.append_entry(
+                    lambda s: s.append_entries(
                         self._current_term,
                         self.id,
                         self._last_applied,
@@ -128,7 +128,14 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             if committed_amount >= int(len(self._cluster) * FLEXIBLE_PAXOS_QUORUM):
                 self._commit_command(command)
 
-    async def _begin_election(self):
+    async def _run_leader_task(self):
+        while True:
+            await asyncio.sleep(
+                ELECTION_TIMEOUT * 0.9
+            )  # Just in case there is high latency
+            await self._send_hbeat()
+
+    async def _run_election_task(self):
         self._current_term += 1
         await self._change_state(State.CANDIDATE)
         last_log_index = self._last_applied
@@ -162,5 +169,37 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
     async def _queue_command(self, command: Command):
         await self._commands_queue.put(command)
 
+    async def _send_hbeat(self):
+        for s in filter(lambda s: s != self, self.cluster):
+            asyncio.create_task(
+                s.append_entries(
+                    self._current_term,
+                    self.id,
+                    self._last_applied,
+                    self._log[self._last_applied].term,
+                    None,
+                    self._commit_index,
+                )
+            )
+
+    def _change_state(self, new_state: State):
+        if new_state is State.FOLLOWER:
+            if self._leader_task and not self._leader_task.cancelled():
+                self._leader_task.cancel()
+            if self._election_task and not self._election_task.cancelled():
+                self._election_task.cancel()
+            self._state = State.FOLLOWER
+            pass  # TODO
+        elif new_state is State.LEADER:
+            self._leader_task = asyncio.create_task(self._run_leader_task())
+            self._state = State.LEADER
+            pass  # TODO
+        elif new_state is State.CANDIDATE:
+            if self._leader_task and not self._leader_task.cancelled():
+                self._leader_task.cancel()
+                self._state = State.CANDIDATE
+            self._election_task = asyncio.create_task(self._run_election_task())
+            pass  # TODO
+
     def _im_leader(self):
-        return self._leader is self
+        return self._state is State.LEADER

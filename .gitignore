@@ -114,3 +114,5 @@ Pipfile.lock
 logs
 !logs/.gitkeep
 
+# todo
+TODO*
