@@ -71,7 +71,9 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         self._entries_task = None
         self._hbeat_task = None
 
-        self._append_tasks = []
+        self._append_tasks = (
+            {}
+        )  # TODO: every cluster member has a list of tasks running
         # TODO: init tasks
 
     async def update_state(self, key, value):
@@ -127,9 +129,14 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
     async def _run_entries_task_(self):
         command = await self._commands_queue.get()
         self._append_command(command)
-        rpc_calls = list(
-            map(lambda s: self._append_entry_task(s, len(self._log) - 1), self._cluster)
-        )
+        rpc_calls = []
+        for server in filter(lambda s: s is not self, self.cluster):
+            append_task = asyncio.create_task(
+                self._append_entry_task(s, len(self._log) - 1)
+            )
+            rpc_calls.append(append_task)
+            self._append_tasks[server.id].append(append_task)
+
         committed_amount = 1  # Starts on '1' because of itself
         for rpc_call in asyncio.as_completed(rpc_calls):
             await rpc_call.result()
@@ -162,7 +169,6 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                 filter(lambda s: s is not self, self._cluster),
             )
         )
-        self._append_tasks.extend(voting_rpcs)  # For cancelling when is no more Leader
         granted_votes = 1  # 1 -> its own vote
         votes = 1
         election_win = False
@@ -184,9 +190,9 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         await self._commands_queue.put(command)
 
     async def _send_hbeat(self):
-        for s in filter(lambda s: s != self, self.cluster):
-            asyncio.create_task(
-                s.append_entries(
+        for server in filter(lambda s: s != self, self.cluster):
+            task = asyncio.create_task(
+                server.append_entries(
                     self._current_term,
                     self.id,
                     self._last_applied,
@@ -195,6 +201,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                     self._commit_index,
                 )
             )
+            self._append_tasks[server.id].append(task)
 
     def _change_state(self, new_state: State):
         if new_state is State.FOLLOWER:
@@ -220,12 +227,14 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         if self._entries_task and not self._entries_task.cancelled():
             self._entries_task.cancel()
         self._cancel_append_tasks()
+        self._cluster_locks.clear()
 
     def _cancel_append_tasks(self):
-        for append_task in self._append_tasks:
-            if not append_task.cancelled():
-                append_task.cancel()
-        self._append_tasks.clear()
+        for server_tasks in self._append_tasks.values():
+            for task in server_tasks:
+                if not task.cancelled():
+                    task.cancel()
+            server_tasks.clear()
 
     def _cancel_candidate_tasks(self):
         if self._election_task and not self._election_task.cancelled():

@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Any, List, Union, Dict
 
-from .. import errors
 from .. import state_machine
 
 
@@ -40,19 +39,6 @@ class RPC(IntEnum):
 
 
 ## Translation functions
-async def read_decode_msg(reader):
-    opcode = (await reader.readuntil(SEPARATOR))[:-1]
-    opcode = int.from_bytes(opcode, "big")
-    payload_length = (await reader.readuntil(SEPARATOR))[:-1]
-    payload_length = int.from_bytes(payload_length, "big")
-    payload = await reader.read(payload_length)
-    return RaftMessage(opcode, payload)
-
-
-async def encode_send_msg(writer, opcode: int, payload: bytes):
-    msg = bytes([opcode]) + SEPARATOR + dump_data_with_length(payload)
-    writer.write(msg)
-    await writer.drain()
 
 
 def encode_request_vote(
@@ -112,21 +98,6 @@ def encode_command_request(command: state_machine.Command):
 
 def decode_command_request(payload: bytes):
     pass  # TODO
-
-
-async def send_ok(writer):
-    await encode_send_msg(writer, RPC.OK, EMPTY)
-
-
-async def read_check_ok(reader):
-    message = await read_decode_msg(reader)
-    if message.opcode is RPC.ERROR_TERM:
-        term = message.payload["term"]
-        raise errors.TermConsistencyError(term)
-    elif message.opcode is RPC.ERROR_ENTRY:
-        raise errors.EntriesConsistencyError()
-    elif message.opcode is not RPC.OK:
-        raise errors.RPCError()
 
 
 ## UTILS

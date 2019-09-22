@@ -1,23 +1,27 @@
 import asyncio
-import json
 from contextlib import asynccontextmanager
-from typing import List, Tuple
+from typing import Tuple
 
-from raft_asyncio import server, state_machine, errors
-from . import protocol as prot
+from raft_asyncio import server, errors
+from .protocol import *
 
 CONNECTION_TIMEOUT = 5
 
 
 # UTILS
 def check_consistency(
-    raft_server: server.RaftServer, term: int, entries: List[state_machine.Entry] = None
+    raft_server: server.RaftServer, term: int, prev_log: Tuple[int, int] = None
 ):
     if term < raft_server._current_term:
         raft_server._change_state(state_machine.State.FOLLOWER)
         raise errors.TermConsistencyError(term)
-    if entries:
-        pass  # TODO: check entries consistency
+    if prev_log:
+        prev_log_index, prev_log_term = prev_log
+        try:
+            if raft_server._log[prev_log_index] != prev_log_term:
+                raise errors.EntriesConsistencyError()
+        except:
+            raise errors.EntriesConsistencyError()
 
 
 def consistency_decorator(func):
@@ -27,12 +31,42 @@ def consistency_decorator(func):
         except errors.TermConsistencyError:
             payload = {"term": raft_server._current_term}  # TODO: more data?
             payload = json.dumps(payload).encode()
-            await prot.encode_send_msg(writer, prot.RPC.ERROR_TERM, payload)
+            await encode_send_msg(writer, RPC.ERROR_TERM, payload)
         except errors.EntriesConsistencyError:
-            payload = prot.EMPTY  # TODO: send data?
-            await prot.encode_send_msg(writer, prot.RPC.ERROR_ENTRY, payload)
+            payload = EMPTY  # TODO: send data?
+            await encode_send_msg(writer, RPC.ERROR_ENTRY, payload)
 
     return wrapper
+
+
+async def send_ok(writer):
+    await encode_send_msg(writer, RPC.OK, EMPTY)
+
+
+async def read_check_ok(reader):
+    message = await read_decode_msg(reader)
+    if message.opcode is RPC.ERROR_TERM:
+        term = message.payload["term"]
+        raise errors.TermConsistencyError(term)
+    elif message.opcode is RPC.ERROR_ENTRY:
+        raise errors.EntriesConsistencyError()
+    elif message.opcode is not RPC.OK:
+        raise errors.RPCError()
+
+
+async def read_decode_msg(reader):
+    opcode = (await reader.readuntil(SEPARATOR))[:-1]
+    opcode = int.from_bytes(opcode, "big")
+    payload_length = (await reader.readuntil(SEPARATOR))[:-1]
+    payload_length = int.from_bytes(payload_length, "big")
+    payload = await reader.read(payload_length)
+    return RaftMessage(opcode, payload)
+
+
+async def encode_send_msg(writer, opcode: int, payload: bytes):
+    msg = bytes([opcode]) + SEPARATOR + dump_data_with_length(payload)
+    writer.write(msg)
+    await writer.drain()
 
 
 ## Outgoing calls
@@ -60,11 +94,11 @@ class RemoteRaftServer(server.ClusterMember):
         """
         with connect(self) as connection:
             reader, writer = connection
-            payload = prot.encode_append_entry(
+            payload = encode_append_entry(
                 term, leader_id, prev_log_index, prev_log_term, entries, leader_commit
             )
-            await prot.encode_send_msg(writer, prot.RPC.APPEND_ENTRY, payload)
-            await prot.read_check_ok(reader)  # TODO?
+            await encode_send_msg(writer, RPC.APPEND_ENTRY, payload)
+            await read_check_ok(reader)  # TODO?
 
     async def request_vote(
         self, term: int, candidate_id: bytes, last_log_index: int, last_log_term: int
@@ -81,18 +115,18 @@ class RemoteRaftServer(server.ClusterMember):
         """
         with connect(self) as connection:
             reader, writer = connection
-            payload = prot.encode_request_vote(
+            payload = encode_request_vote(
                 term, candidate_id, last_log_index, last_log_term
             )
-            await prot.encode_send_msg(writer, prot.RPC.REQUEST_VOTE, payload)
+            await encode_send_msg(writer, RPC.REQUEST_VOTE, payload)
             vote = await reader.read(1)
         return vote
 
     async def command_request(self, command: state_machine.Command):
         with connect(self) as connection:
             reader, writer = connection
-            payload = prot.encode_command_request(command)
-            await prot.encode_send_msg(writer, prot.RPC.COMMAND_REQUEST, payload)
+            payload = encode_command_request(command)
+            await encode_send_msg(writer, RPC.COMMAND_REQUEST, payload)
             # TODO
 
     async def add_cluster_configuration(self, cluster: List[server.ClusterMember]):
@@ -101,10 +135,8 @@ class RemoteRaftServer(server.ClusterMember):
     async def get_cluster_configuration(self):
         with connect(self) as connection:
             reader, writer = connection
-            payload = prot.EMPTY
-            await prot.encode_send_msg(
-                writer, prot.RPC.GET_CLUSTER_CONFIGURATION, payload
-            )
+            payload = EMPTY
+            await encode_send_msg(writer, RPC.GET_CLUSTER_CONFIGURATION, payload)
 
             # TODO: read and return cluster and leader
 
@@ -125,42 +157,36 @@ async def connect(dst: RemoteRaftServer, raise_error=True):
 ## Ingoing calls
 # Main switch case for Requests
 async def handle_request(
-    raft_server: server.RaftServer, connection: Tuple, message: prot.RaftMessage
+    raft_server: server.RaftServer, connection: Tuple, message: RaftMessage
 ):
     reader, writer = connection
 
-    if message.opcode is prot.RPC.REQUEST_VOTE:
+    if message.opcode is RPC.REQUEST_VOTE:
         raft_server._leader_hbeat.set()
         await process_vote(raft_server, writer, message)
-    elif message.opcode is prot.RPC.APPEND_ENTRY:
+    elif message.opcode is RPC.APPEND_ENTRY:
         raft_server._leader_hbeat.set()
         await process_entry(raft_server, writer, message)
-    elif message.opcode is prot.RPC.COMMAND_REQUEST:
+    elif message.opcode is RPC.COMMAND_REQUEST:
         if raft_server._im_leader():
             await process_command_request(raft_server, writer, message)
         else:
-            await prot.encode_send_msg(
-                writer, prot.RPC.ERROR_LEADER, raft_server.leader.id
-            )
-    elif message.opcode is prot.RPC.ADD_CLUSTER_CONFIGURATION:
+            await encode_send_msg(writer, RPC.ERROR_LEADER, raft_server.leader.id)
+    elif message.opcode is RPC.ADD_CLUSTER_CONFIGURATION:
         pass  # TODO
-    elif message.opcode is prot.RPC.GET_CLUSTER_CONFIGURATION:
+    elif message.opcode is RPC.GET_CLUSTER_CONFIGURATION:
         await process_cluster(raft_server, writer)
 
 
 @consistency_decorator
 async def process_vote(
-    raft_server: server.RaftServer, writer, raft_message: prot.RaftMessage
+    raft_server: server.RaftServer, writer, raft_message: RaftMessage
 ):
-    term, id, last_log_index, last_log_term = prot.decode_request_vote(
-        raft_message.payload
-    )
+    term, id, last_log_index, last_log_term = decode_request_vote(raft_message.payload)
     check_consistency(raft_server, term)
-    if is_vote_granted(raft_server, term, id, last_log_index, last_log_term):
-        writer.write(int(True))
-        await writer.drain()
-    else:
-        pass  # TODO
+    vote = is_vote_granted(raft_server, term, id, last_log_index, last_log_term)
+    writer.write(int(vote))
+    await writer.drain()
 
 
 def is_vote_granted(raft_server, term, candidate_id, last_log_index, last_log_term):
@@ -179,18 +205,23 @@ def is_vote_granted(raft_server, term, candidate_id, last_log_index, last_log_te
 
 @consistency_decorator
 async def process_entry(
-    raft_server: server.RaftServer, writer, raft_message: prot.RaftMessage
+    raft_server: server.RaftServer, writer, raft_message: RaftMessage
 ):
-    term, leader_id, prev_log_index, prev_log_term, entries, leader_commit = prot.decode_append_entry(
+    term, leader_id, prev_log_index, prev_log_term, entries, leader_commit = decode_append_entry(
         raft_message.payload
     )
     check_consistency(raft_server, term, entries)
-    raft_server._leader_hbeat.set()
-    if entries:  # It is not a hbeat
-        pass  # TODO:
-    else:  # It is a hbeat
+    if raft_server._im_leader() and term > raft_server._current_term:
         raft_server._change_state(state_machine.State.FOLLOWER)
-        pass  # TODO:
+    if entries:  # It is not a hbeat
+        entries_amount = len(entries)
+        raft_server._log[-entries_amount:] = entries
+        raft_server._commit_index = leader_commit
+        raft_server._last_applied = max(
+            raft_server._last_applied, raft_server._commit_index
+        )
+    else:  # It is a hbeat
+        raft_server._leader_hbeat.set()
 
 
 def is_entry_appendable(
@@ -206,11 +237,11 @@ def is_entry_appendable(
 
 @consistency_decorator
 async def process_command_request(
-    raft_server: server.RaftServer, writer, raft_message: prot.RaftMessage
+    raft_server: server.RaftServer, writer, raft_message: RaftMessage
 ):
-    command = prot.decode_command_request(raft_message.payload)
+    command = decode_command_request(raft_message.payload)
     await raft_server._queue_command(command)
-    await prot.send_ok(writer)
+    await send_ok(writer)
 
 
 async def process_cluster(raft_server: server.RaftServer, writer):
