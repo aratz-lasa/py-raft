@@ -2,9 +2,10 @@ import asyncio
 from typing import List
 
 from . import utils
-from .rpc import rpc
-from .rpc import protocol as prot
 from .abc import IRaftServer
+from .errors import *
+from .rpc import protocol as prot
+from .rpc import rpc
 from .state_machine import RaftStateMachine, State, Command
 
 ELECTION_TIMEOUT = 0.5
@@ -34,9 +35,9 @@ class Server(ClusterMember):
         )
 
     async def _handle_request(self, reader, writer):
-        request = prot.read_decode_msg(reader, writer)
+        message = await prot.read_decode_msg(reader)
         if isinstance(self, RaftServer):
-            await rpc.handle_request(self, request)
+            await rpc.handle_request(self, (reader, writer), message)
         else:
             raise TypeError("Invalid Server instance")
         writer.close()
@@ -59,6 +60,11 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         self._commands_queue = (
             asyncio.Queue()
         )  # Queue where commands waiting for commit process to start  are stored
+
+        self._cluster_locks = (
+            {}
+        )  # Lock for mantaining order when several AppendEntries RPC calls are sent for same server
+
         self._election_task = None
         self._commit_task = None
         self._leader_task = None
@@ -101,20 +107,13 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             finally:
                 self._leader_hbeat.clear()
 
-    async def _run_commit_task_(self):
+    async def _run_entries_task_(self):
         while True:
             command = await self._commands_queue.get()
             self._append_command(command)
             rpc_calls = list(
                 map(
-                    lambda s: s.append_entries(
-                        self._current_term,
-                        self.id,
-                        self._last_applied,
-                        self._log[self._last_applied].term,
-                        command,
-                        self._commit_index,
-                    ),
+                    lambda s: self._append_entry_task(s, len(self._log) - 1),
                     self._cluster,
                 )
             )
@@ -123,29 +122,31 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                 try:
                     await rpc_call.result()
                     committed_amount += 1
-                except:
+                except asyncio.TimeoutError:
                     pass
             if committed_amount >= int(len(self._cluster) * FLEXIBLE_PAXOS_QUORUM):
                 self._commit_command(command)
 
-    async def _run_leader_task(self):
+    async def _run_hbeat_task(self):
         while True:
+            await self._send_hbeat()
             await asyncio.sleep(
                 ELECTION_TIMEOUT * 0.9
             )  # Just in case there is high latency
-            await self._send_hbeat()
 
-    async def _run_election_task(self):
+    async def _run_candidate_task(self):
         self._current_term += 1
-        await self._change_state(State.CANDIDATE)
+        self._leader_hbeat.set()
         last_log_index = self._last_applied
-        last_log_term = 0 if not self._log else self._log[last_log_index].term
+        last_log_term = (
+            0 if not len(self._log) > last_log_index else self._log[last_log_index].term
+        )
         voting_rpcs = list(
             map(
                 lambda s: s.request_vote(
                     self._current_term, self.id, last_log_index, last_log_term
                 ),
-                self._cluster,
+                filter(lambda s: s is not self, self._cluster),
             )
         )
         granted_votes = 1  # 1 -> its own vote
@@ -155,7 +156,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             try:
                 vote = (await next_vote).result()
                 granted_votes += int(vote)
-            except:
+            except asyncio.TimeoutError:
                 pass
             votes += 1
             if granted_votes >= int(
@@ -163,8 +164,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             ):  # Equal because itself is not considered
                 election_win = True
         if election_win:
-            pass
-            # TODO: change to leader
+            self._change_state(State.LEADER)
 
     async def _queue_command(self, command: Command):
         await self._commands_queue.put(command)
@@ -191,15 +191,37 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             self._state = State.FOLLOWER
             pass  # TODO
         elif new_state is State.LEADER:
-            self._leader_task = asyncio.create_task(self._run_leader_task())
+            self._leader_task = asyncio.create_task(self._run_hbeat_task())
             self._state = State.LEADER
             pass  # TODO
         elif new_state is State.CANDIDATE:
             if self._leader_task and not self._leader_task.cancelled():
                 self._leader_task.cancel()
-                self._state = State.CANDIDATE
-            self._election_task = asyncio.create_task(self._run_election_task())
+            self._election_task = asyncio.create_task(self._run_candidate_task())
+            self._state = State.CANDIDATE
             pass  # TODO
 
     def _im_leader(self):
         return self._state is State.LEADER
+
+    async def _append_entry_task(
+        self, server: rpc.RemoteRaftServer, entries_index: int
+    ):
+        async with self._cluster_locks[server.id]:
+            while True:
+                try:
+                    await server.append_entries(
+                        self._current_term,
+                        self.id,
+                        max(entries_index - 1, 0),
+                        self._log[max(entries_index - 1, 0)].term,
+                        self._log[entries_index:],
+                        self._commit_index,
+                    )
+                except TermConsistencyError as error:
+                    self._current_term = error.term
+                    self._change_state(State.FOLLOWER)
+                except EntriesConsistencyError:
+                    await self._append_entry_task(server, max(entries_index - 1, 0))
+                except:  # Network error, so retry until it answers
+                    await self._append_entry_task(server, entries_index)

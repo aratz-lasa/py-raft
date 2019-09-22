@@ -3,16 +3,14 @@ import math
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Any, List, Union, Dict
-from .. import errors
 
+from .. import errors
 from .. import state_machine
 
 
 # Structures
 @dataclass
 class RaftMessage:
-    reader: Any = field(default=None)
-    writer: Any = field(default=None)
     opcode: Any = field(default=None)
     payload: Any = field(default=None)
 
@@ -27,25 +25,33 @@ EMPTY = b""
 
 
 class RPC(IntEnum):
+    # Opcodes
     APPEND_ENTRY = auto()
     COMMAND_REQUEST = auto()
     REQUEST_VOTE = auto()
     ADD_CLUSTER_CONFIGURATION = auto()
     GET_CLUSTER_CONFIGURATION = auto()
+    # Ok
+    OK = auto()
+    # Errors
+    ERROR_TERM = auto()
+    ERROR_ENTRY = auto()
 
 
 ## Translation functions
-async def read_decode_msg(reader, writer):
+async def read_decode_msg(reader):
     opcode = (await reader.readuntil(SEPARATOR))[:-1]
     opcode = int.from_bytes(opcode, "big")
     payload_length = (await reader.readuntil(SEPARATOR))[:-1]
     payload_length = int.from_bytes(payload_length, "big")
     payload = await reader.read(payload_length)
-    return RaftMessage(reader, writer, opcode, payload)
+    return RaftMessage(opcode, payload)
 
 
-def encode_msg(opcode: int, payload: bytes) -> bytes:
-    return bytes([opcode]) + SEPARATOR + dump_data_with_length(payload)
+async def encode_send_msg(writer, opcode: int, payload: bytes):
+    msg = bytes([opcode]) + SEPARATOR + dump_data_with_length(payload)
+    writer.write(msg)
+    await writer.drain()
 
 
 def encode_request_vote(
@@ -108,13 +114,17 @@ def decode_command_request(payload: bytes):
 
 
 async def send_ok(writer):
-    writer.write(bytes([OK_RESPONSE]))
-    await writer.drain()
+    await encode_send_msg(writer, RPC.OK, EMPTY)
 
 
 async def read_check_ok(reader):
-    ok = int.from_bytes(await reader.read(1), "big") == OK_RESPONSE
-    if not ok:
+    message = await read_decode_msg(reader)
+    if message.opcode is RPC.ERROR_TERM:
+        term = message.payload["term"]
+        raise errors.TermConsistencyError(term)
+    elif message.opcode is RPC.ERROR_ENTRY:
+        raise errors.EntriesConsistencyError()
+    elif message.opcode is not RPC.OK:
         raise errors.RPCError()
 
 
