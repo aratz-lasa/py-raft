@@ -66,8 +66,12 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         )  # Lock for mantaining order when several AppendEntries RPC calls are sent for same server
 
         self._election_task = None
-        self._commit_task = None
-        self._leader_task = None
+        self._timeout_task = None
+
+        self._entries_task = None
+        self._hbeat_task = None
+
+        self._append_tasks = []
         # TODO: init tasks
 
     async def update_state(self, key, value):
@@ -75,7 +79,17 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         if self._leader is self:
             await self._queue_command(command)
         else:
-            await self._leader.command_request(command)
+            while True:
+                try:
+                    await self._leader.command_request(command)
+                    break
+                except TermConsistencyError as error:
+                    self._current_term = error.term
+                    pass  # TODO: do something else?
+                except LeaderConsistencyError as error:
+                    self.leader = list(
+                        filter(lambda s: s.id == error.leader_id, self.cluster)
+                    )[0]
 
     async def join_cluster(self, random_server: ClusterMember):
         if random_server:
@@ -83,8 +97,11 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
             self.cluster, leader_id = await remote_server.get_cluster_configuration()
             self.leader = list(filter(lambda s: s.id == leader_id, self.cluster))[0]
 
-            self.cluster.append(self)
-            # TODO: init configuration change
+            if self not in self.cluster:
+                self.cluster.append(self)
+                # TODO: init configuration change
+            else:
+                pass  # TODO: means it already was in the cluster, but it had crushed
         else:
             pass  # TODO: first cluster member
 
@@ -108,24 +125,18 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                 self._leader_hbeat.clear()
 
     async def _run_entries_task_(self):
-        while True:
-            command = await self._commands_queue.get()
-            self._append_command(command)
-            rpc_calls = list(
-                map(
-                    lambda s: self._append_entry_task(s, len(self._log) - 1),
-                    self._cluster,
-                )
-            )
-            committed_amount = 1  # Starts on '1' because of itself
-            for rpc_call in asyncio.as_completed(*rpc_calls, timeout=RPC_TIMEOUT):
-                try:
-                    await rpc_call.result()
-                    committed_amount += 1
-                except asyncio.TimeoutError:
-                    pass
+        command = await self._commands_queue.get()
+        self._append_command(command)
+        rpc_calls = list(
+            map(lambda s: self._append_entry_task(s, len(self._log) - 1), self._cluster)
+        )
+        committed_amount = 1  # Starts on '1' because of itself
+        for rpc_call in asyncio.as_completed(rpc_calls):
+            await rpc_call.result()
+            committed_amount += 1
             if committed_amount >= int(len(self._cluster) * FLEXIBLE_PAXOS_QUORUM):
                 self._commit_command(command)
+                break
 
     async def _run_hbeat_task(self):
         while True:
@@ -134,7 +145,7 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                 ELECTION_TIMEOUT * 0.9
             )  # Just in case there is high latency
 
-    async def _run_candidate_task(self):
+    async def _run_election_task(self):
         self._current_term += 1
         self._leader_hbeat.set()
         last_log_index = self._last_applied
@@ -143,16 +154,19 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
         )
         voting_rpcs = list(
             map(
-                lambda s: s.request_vote(
-                    self._current_term, self.id, last_log_index, last_log_term
+                lambda s: asyncio.create_task(
+                    s.request_vote(
+                        self._current_term, self.id, last_log_index, last_log_term
+                    )
                 ),
                 filter(lambda s: s is not self, self._cluster),
             )
         )
+        self._append_tasks.extend(voting_rpcs)  # For cancelling when is no more Leader
         granted_votes = 1  # 1 -> its own vote
         votes = 1
         election_win = False
-        for next_vote in asyncio.as_completed(*voting_rpcs, timeout=RPC_TIMEOUT):
+        for next_vote in asyncio.as_completed(voting_rpcs, timeout=RPC_TIMEOUT):
             try:
                 vote = (await next_vote).result()
                 granted_votes += int(vote)
@@ -184,22 +198,38 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
 
     def _change_state(self, new_state: State):
         if new_state is State.FOLLOWER:
-            if self._leader_task and not self._leader_task.cancelled():
-                self._leader_task.cancel()
-            if self._election_task and not self._election_task.cancelled():
-                self._election_task.cancel()
+            self._cancel_leader_tasks()
+            self._cancel_candidate_tasks()
+            self._timeout_task = asyncio.create_task(self._run_timeout_task())
             self._state = State.FOLLOWER
-            pass  # TODO
         elif new_state is State.LEADER:
-            self._leader_task = asyncio.create_task(self._run_hbeat_task())
+            if self._timeout_task and not self._timeout_task.cancelled():
+                self._timeout_task.cancel()
+            self._hbeat_task = asyncio.create_task(self._run_hbeat_task())
+            self._entries_task = asyncio.create_task(self._run_entries_task_())
             self._state = State.LEADER
-            pass  # TODO
         elif new_state is State.CANDIDATE:
-            if self._leader_task and not self._leader_task.cancelled():
-                self._leader_task.cancel()
-            self._election_task = asyncio.create_task(self._run_candidate_task())
+            self._cancel_leader_tasks()
+            self._cancel_candidate_tasks()
+            self._election_task = asyncio.create_task(self._run_election_task())
             self._state = State.CANDIDATE
-            pass  # TODO
+
+    def _cancel_leader_tasks(self):
+        if self._hbeat_task and not self._hbeat_task.cancelled():
+            self._hbeat_task.cancel()
+        if self._entries_task and not self._entries_task.cancelled():
+            self._entries_task.cancel()
+        self._cancel_append_tasks()
+
+    def _cancel_append_tasks(self):
+        for append_task in self._append_tasks:
+            if not append_task.cancelled():
+                append_task.cancel()
+        self._append_tasks.clear()
+
+    def _cancel_candidate_tasks(self):
+        if self._election_task and not self._election_task.cancelled():
+            self._election_task.cancel()
 
     def _im_leader(self):
         return self._state is State.LEADER
@@ -218,10 +248,12 @@ class RaftServer(IRaftServer, Server, RaftStateMachine):
                         self._log[entries_index:],
                         self._commit_index,
                     )
+                    break
                 except TermConsistencyError as error:
                     self._current_term = error.term
                     self._change_state(State.FOLLOWER)
+                    break
                 except EntriesConsistencyError:
-                    await self._append_entry_task(server, max(entries_index - 1, 0))
-                except:  # Network error, so retry until it answers
-                    await self._append_entry_task(server, entries_index)
+                    entries_index = max(entries_index - 1, 0)
+                except:
+                    pass  # Network error, so retry until it answers

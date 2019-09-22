@@ -11,5 +11,10 @@ class TermConsistencyError(ConsistencyError):
         self.term = term
 
 
+class LeaderConsistencyError(ConsistencyError):
+    def __init__(self, leader_id: bytes):
+        self.leader_id = leader_id
+
+
 class EntriesConsistencyError(ConsistencyError):
     pass

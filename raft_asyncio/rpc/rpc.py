@@ -29,7 +29,7 @@ def consistency_decorator(func):
             payload = json.dumps(payload).encode()
             await prot.encode_send_msg(writer, prot.RPC.ERROR_TERM, payload)
         except errors.EntriesConsistencyError:
-            payload = b""  # TODO: send data?
+            payload = prot.EMPTY  # TODO: send data?
             await prot.encode_send_msg(writer, prot.RPC.ERROR_ENTRY, payload)
 
     return wrapper
@@ -139,7 +139,9 @@ async def handle_request(
         if raft_server._im_leader():
             await process_command_request(raft_server, writer, message)
         else:
-            pass  # TODO
+            await prot.encode_send_msg(
+                writer, prot.RPC.ERROR_LEADER, raft_server.leader.id
+            )
     elif message.opcode is prot.RPC.ADD_CLUSTER_CONFIGURATION:
         pass  # TODO
     elif message.opcode is prot.RPC.GET_CLUSTER_CONFIGURATION:

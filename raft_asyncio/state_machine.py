@@ -38,7 +38,7 @@ class RaftStateMachine:
         self._current_term = 0  # latest term server has see
 
     def _commit_command(self, command: Command):
-        self._commit_index = self._log.index(command)
+        self._commit_index = max(self._log.index(command), self._commit_index)
 
     def _append_command(self, command: Command):
         entry = Entry(command=command, term=self._current_term)

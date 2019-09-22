@@ -36,6 +36,7 @@ class RPC(IntEnum):
     # Errors
     ERROR_TERM = auto()
     ERROR_ENTRY = auto()
+    ERROR_LEADER = auto()
 
 
 ## Translation functions
