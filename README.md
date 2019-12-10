@@ -4,7 +4,7 @@
 [![Python 3.7](https://img.shields.io/badge/python-3.7-blue.svg)](https://www.python.org/downloads/release/python-370/)
 [![black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-Python **asyncio RAFT (Flexible Paxos)** consensus algorithm implementation.
+Python **asyncio RAFT (Flexible Paxos)** consensus algorithm implementation [under development].
 
 ## What is Raft?
 Raft is a consensus algorithm that is designed to be easy to understand. It's equivalent to Paxos in fault-tolerance and performance.
